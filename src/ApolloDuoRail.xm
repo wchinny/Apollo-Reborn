@@ -348,6 +348,54 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
     sApolloDuoClampingFloatingButton = NO;
 }
 
+// Folded, UIKit moves a page's Back and action buttons into the trailing system
+// rail, leaving a thread's "104 Comments" or a feed's "Apple" Jump Bar alone in
+// a full-width title row above the content. An item with neither a title nor a
+// title view gets no title row there, so the page uses the cover's full height
+// and only its search bar remains (it still scrolls away). Hiding the bar
+// instead would also take the rail's actions with it. Apollo keeps writing its
+// title and Jump Bar; the item withholds them from UIKit while folded and
+// presents them again once unfolded. The feed keeps its own jumpBar ivar, so
+// the withheld control stays live for Apollo and the subreddit switcher.
+static char kApolloDuoFoldedTitleKey;
+
+@interface ApolloDuoFoldedTitle : NSObject
+@property (nonatomic, copy) NSString *title;
+@property (nonatomic, strong) UIView *titleView;
+@end
+@implementation ApolloDuoFoldedTitle
+@end
+
+static BOOL ApolloDuoWithholdsTitle(void) {
+    return ApolloDuoUsesAdaptiveBars() && ApolloDuoUsesCoverContentInsets();
+}
+
+// Change-gated: writes only when the fold state changes what UIKit should show,
+// so repeating it from layout callbacks never invalidates the bar again.
+static void ApolloDuoApplyFoldedTitle(UIViewController *controller) {
+    UINavigationItem *item = controller.navigationItem;
+    if (!item) return;
+    ApolloDuoFoldedTitle *state = objc_getAssociatedObject(item, &kApolloDuoFoldedTitleKey);
+    if (!state) {
+        state = [ApolloDuoFoldedTitle new];
+        state.title = item.title;
+        state.titleView = item.titleView;
+        objc_setAssociatedObject(item, &kApolloDuoFoldedTitleKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    BOOL withhold = ApolloDuoWithholdsTitle();
+    NSString *title = withhold ? nil : state.title;
+    UIView *titleView = withhold ? nil : state.titleView;
+    NSString *currentTitle = item.title;
+    BOOL titleMatches = currentTitle == title || [currentTitle isEqualToString:title];
+    if (titleMatches && item.titleView == titleView) return;
+    ApolloLog(@"[DuoRail] %@ title %@ (%lu chars, view=%d)", NSStringFromClass(controller.class),
+              withhold ? @"hidden while folded" : @"restored",
+              (unsigned long)state.title.length, state.titleView != nil);
+    // The setter hooks below apply the fold policy.
+    item.title = state.title;
+    item.titleView = state.titleView;
+}
+
 %group ApolloDuoRailTabs
 
 %hook _TtC6Apollo22ApolloTabBarController
@@ -578,6 +626,8 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
 - (void)viewDidLayoutSubviews {
     %orig;
     ApolloDuoCoverAdjustJumpButton((UIViewController *)self);
+    // A fold or unfold resizes a thread that stays on screen.
+    ApolloDuoApplyFoldedTitle((UIViewController *)self);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -588,6 +638,8 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
 
 - (void)viewWillAppear:(BOOL)animated {
     sApolloDuoActiveComments = (UIViewController *)self;
+    // Before the bar first lays out this item, so the title row never flashes.
+    ApolloDuoApplyFoldedTitle((UIViewController *)self);
     %orig(animated);
 }
 
@@ -605,6 +657,12 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
 - (void)viewDidLayoutSubviews {
     %orig;
     ApolloDuoRailAdjustHideReadButton((UIViewController *)self);
+    ApolloDuoApplyFoldedTitle((UIViewController *)self);
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    ApolloDuoApplyFoldedTitle((UIViewController *)self);
+    %orig(animated);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -628,6 +686,33 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
 - (void)setCenter:(CGPoint)center {
     %orig(center);
     ApolloDuoAdjustFloatingActionButton(self);
+}
+
+%end
+
+// Apollo sets "Comments" and later "N Comments" on a thread's item, and a feed's
+// Jump Bar as its title view. Keep the latest values for unfolding, and present
+// them only where the title has a row of its own.
+%hook UINavigationItem
+
+- (void)setTitle:(NSString *)title {
+    ApolloDuoFoldedTitle *state = objc_getAssociatedObject(self, &kApolloDuoFoldedTitleKey);
+    if (!state) {
+        %orig(title);
+        return;
+    }
+    state.title = title;
+    %orig(ApolloDuoWithholdsTitle() ? nil : title);
+}
+
+- (void)setTitleView:(UIView *)titleView {
+    ApolloDuoFoldedTitle *state = objc_getAssociatedObject(self, &kApolloDuoFoldedTitleKey);
+    if (!state) {
+        %orig(titleView);
+        return;
+    }
+    state.titleView = titleView;
+    %orig(ApolloDuoWithholdsTitle() ? nil : titleView);
 }
 
 %end
