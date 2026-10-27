@@ -5,10 +5,11 @@
 
 // Apollo's pans use the whole navigation surface for edge checks. On Duo a
 // visible pane can start well inside that surface, and the outer stack is a
-// containment host. Qualify a right swipe at the *pane's* left content edge,
-// then perform one native animated Back on that exact navigation controller.
-// At the feed root the same gesture reveals the subreddit drawer. Calling the
-// native pop entry point keeps the author's feed/thread restoration animation.
+// containment host. Qualify a right pan at the *pane's* left content edge,
+// then drive Back on that exact navigation controller with the finger, the
+// way Apollo's own edge pan does elsewhere. At the feed root the same gesture
+// reveals the subreddit drawer. Calling the native pop entry point keeps the
+// author's feed/thread restoration animation where the split replaces the pop.
 // Keep row swipe actions elsewhere, and honor Apollo's navigation-gesture opt-out.
 static BOOL ApolloDuoBackSwipeCanNavigate(UINavigationController *navigation) {
     BOOL eligible = ApolloDeviceIsDuo() && navigation.viewIfLoaded.window
@@ -43,43 +44,104 @@ static BOOL ApolloDuoBackSwipeAcceptsPoint(UINavigationController *navigation, C
     return point.x <= CGRectGetMinX(pane) + 28.0;
 }
 
+// Apollo's delegate hands UIKit whatever sits in the navigation controller's
+// typed interactionController slot, as the iPad pane's compact Back relies on
+// (ApolloPaneSetNativeInteractiveTransition). Writing it through Swift keeps
+// the Optional's retain/release balanced.
+extern void ApolloSwiftAssignInteractiveTransition(void *storage, const void *object);
+static BOOL ApolloDuoSetInteractiveTransition(UINavigationController *navigation,
+                                              UIPercentDrivenInteractiveTransition *transition) {
+    Class native = objc_getClass("_TtC6Apollo26ApolloNavigationController");
+    if (!native || navigation.class != native) return NO;
+    Ivar slot = class_getInstanceVariable(native, "interactionController");
+    Ivar previous = class_getInstanceVariable(native, "poppedViewControllers");
+    if (!slot || !previous || ivar_getOffset(slot) - ivar_getOffset(previous) != sizeof(void *)) return NO;
+    ApolloSwiftAssignInteractiveTransition((uint8_t *)(__bridge void *)navigation + ivar_getOffset(slot),
+                                           (__bridge const void *)transition);
+    return YES;
+}
+
 @interface ApolloDuoBackSwipe : NSObject <UIGestureRecognizerDelegate>
 @property(nonatomic, weak) UINavigationController *navigation;
-@property(nonatomic, strong) UISwipeGestureRecognizer *swipe;
+@property(nonatomic, strong) UIPanGestureRecognizer *pan;
+// Set while this pan is the finger behind an interactive pop.
+@property(nonatomic, strong) UIPercentDrivenInteractiveTransition *transition;
 @end
 
 @implementation ApolloDuoBackSwipe
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldReceiveTouch:(UITouch *)touch {
-    return gesture == self.swipe
+    return gesture == self.pan
         && ApolloDuoBackSwipeAcceptsPoint(self.navigation, [touch locationInView:self.navigation.view]);
 }
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gesture {
-    return gesture == self.swipe && ApolloDuoBackSwipeCanNavigate(self.navigation);
-}
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture
-        shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
-    // Vertical table scrolling should not wait for a discrete right swipe.
-    return gesture == self.swipe && [other.view isKindOfClass:UIScrollView.class]
-        && other == ((UIScrollView *)other.view).panGestureRecognizer;
+    if (gesture != self.pan || !ApolloDuoBackSwipeCanNavigate(self.navigation)) return NO;
+    CGPoint velocity = [self.pan velocityInView:self.navigation.view];
+    return velocity.x > 0.0 && fabs(velocity.x) > fabs(velocity.y);
 }
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture
         shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)other {
-    // At the narrow edge strip, give Back priority over horizontal row actions.
-    // Away from that strip shouldReceiveTouch: rejects this recognizer outright.
-    BOOL scrollPan = [other.view isKindOfClass:UIScrollView.class]
-        && other == ((UIScrollView *)other.view).panGestureRecognizer;
-    return gesture == self.swipe && [other isKindOfClass:UIPanGestureRecognizer.class] && !scrollPan;
+    // At the narrow edge strip, give Back priority over row actions and
+    // scrolling; away from that strip shouldReceiveTouch: rejects this
+    // recognizer outright, so nothing else waits on it. A vertical drag fails
+    // it as soon as it moves, and the list scrolls from there. Another pane's
+    // Back pan must not wait on this one while this one waits on it.
+    return gesture == self.pan && [other isKindOfClass:UIPanGestureRecognizer.class]
+        && ![other.delegate isKindOfClass:ApolloDuoBackSwipe.class];
 }
-- (void)swiped:(UISwipeGestureRecognizer *)gesture {
+- (void)panned:(UIPanGestureRecognizer *)gesture {
     UINavigationController *navigation = self.navigation;
-    if (gesture.state != UIGestureRecognizerStateRecognized || !ApolloDuoBackSwipeCanNavigate(navigation)) return;
-    if (navigation.viewControllers.count == 1) {
-        ApolloLog(@"[DuoSwipe] feed root: reveal subreddit drawer");
-        ApolloDuoSplitRevealPostsList(navigation);
-        return;
+    UIView *view = navigation.view;
+    CGFloat width = MAX(1.0, CGRectGetWidth(view.bounds));
+    CGFloat progress = MIN(1.0, MAX(0.0, [gesture translationInView:view].x / width));
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan: {
+            if (!ApolloDuoBackSwipeCanNavigate(navigation)) return;
+            if (navigation.viewControllers.count == 1) {
+                ApolloLog(@"[DuoSwipe] feed root: reveal subreddit drawer");
+                ApolloDuoSplitRevealPostsList(navigation);
+                return;
+            }
+            BOOL animated = !UIAccessibilityIsReduceMotionEnabled();
+            UIPercentDrivenInteractiveTransition *transition = [UIPercentDrivenInteractiveTransition new];
+            transition.completionCurve = UIViewAnimationCurveEaseOut;
+            BOOL interactive = animated && ApolloDuoSetInteractiveTransition(navigation, transition);
+            [navigation popViewControllerAnimated:animated];
+            // The split replaces some pops with its own column animation (closing a
+            // thread beside its feed); those have already run in full.
+            if (interactive && navigation.transitionCoordinator.isInteractive) {
+                self.transition = transition;
+                [transition updateInteractiveTransition:progress];
+            } else if (interactive) {
+                ApolloDuoSetInteractiveTransition(navigation, nil);
+            }
+            ApolloLog(@"[DuoSwipe] Back in pane; stack pages=%lu interactive=%d",
+                      (unsigned long)navigation.viewControllers.count, self.transition != nil);
+            return;
+        }
+        case UIGestureRecognizerStateChanged:
+            [self.transition updateInteractiveTransition:progress];
+            return;
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            UIPercentDrivenInteractiveTransition *transition = self.transition;
+            if (!transition) return;
+            self.transition = nil;
+            // A flick commits from anywhere; a slower release commits past a
+            // third of the way unless the finger was heading back.
+            CGFloat velocity = [gesture velocityInView:view].x;
+            BOOL commit = gesture.state == UIGestureRecognizerStateEnded
+                && (velocity >= 500.0 || (progress >= 0.35 && velocity > -250.0));
+            if (commit) [transition finishInteractiveTransition];
+            else [transition cancelInteractiveTransition];
+            ApolloDuoSetInteractiveTransition(navigation, nil);
+            ApolloLog(@"[DuoSwipe] Back %@ at %.0f%% (velocity %.0f)",
+                      commit ? @"committed" : @"cancelled", progress * 100.0, velocity);
+            return;
+        }
+        default:
+            return;
     }
-    ApolloLog(@"[DuoSwipe] Back in pane; stack pages=%lu", (unsigned long)navigation.viewControllers.count);
-    [navigation popViewControllerAnimated:!UIAccessibilityIsReduceMotionEnabled()];
 }
 @end
 
@@ -92,12 +154,11 @@ void ApolloDuoInstallBackSwipe(UINavigationController *navigation) {
     if (!ApolloDeviceIsDuo() || !navigation.isViewLoaded || ApolloDuoHasBackSwipe(navigation)) return;
     ApolloDuoBackSwipe *owner = [ApolloDuoBackSwipe new];
     owner.navigation = navigation;
-    UISwipeGestureRecognizer *swipe = [[UISwipeGestureRecognizer alloc] initWithTarget:owner action:@selector(swiped:)];
-    swipe.direction = UISwipeGestureRecognizerDirectionRight;
-    swipe.numberOfTouchesRequired = 1;
-    swipe.delegate = owner;
-    swipe.name = @"ApolloReborn.Duo.PaneBack";
-    owner.swipe = swipe;
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:owner action:@selector(panned:)];
+    pan.maximumNumberOfTouches = 1;
+    pan.delegate = owner;
+    pan.name = @"ApolloReborn.Duo.PaneBack";
+    owner.pan = pan;
     objc_setAssociatedObject(navigation, &kApolloDuoBackSwipe, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [navigation.view addGestureRecognizer:swipe];
+    [navigation.view addGestureRecognizer:pan];
 }
